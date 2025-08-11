@@ -4,6 +4,8 @@ using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace StrFind
 {
@@ -38,7 +40,7 @@ namespace StrFind
             // 添加搜索字符串参数
             var searchStringOption = new Option<string>(
                 "--searchstring",
-                description: "要在文件中查找的字符串")
+                description: "要在文件中查找的字符串（包含特殊字符时请使用引号包围）")
             {
                 IsRequired = true
             };
@@ -76,17 +78,28 @@ namespace StrFind
             outputFormatOption.SetDefaultValue("path");
             rootCommand.AddOption(outputFormatOption);
 
-            // 设置命令处理程序
-            rootCommand.SetHandler((directory, fileName, searchString, ignoreCase, useRegex, outputFormat) =>
+            // 添加忽略目录选项
+            var excludeDirsOption = new Option<string[]>(
+                "--exclude",
+                description: "要忽略的目录名称，多个目录用逗号分隔，例如: bin,obj,node_modules")
             {
-                FindFiles(directory, fileName, searchString, ignoreCase, useRegex, outputFormat);
-            }, directoryOption, fileNameOption, searchStringOption, ignoreCaseOption, regexOption, outputFormatOption);
+                IsRequired = false,
+                AllowMultipleArgumentsPerToken = true
+            };
+            excludeDirsOption.AddAlias("-e");
+            rootCommand.AddOption(excludeDirsOption);
+
+            // 设置命令处理程序
+            rootCommand.SetHandler((directory, fileName, searchString, ignoreCase, useRegex, outputFormat, excludeDirs) =>
+            {
+                FindFiles(directory, fileName, searchString, ignoreCase, useRegex, outputFormat, excludeDirs);
+            }, directoryOption, fileNameOption, searchStringOption, ignoreCaseOption, regexOption, outputFormatOption, excludeDirsOption);
 
             // 解析命令行参数
             return await rootCommand.InvokeAsync(args);
         }
 
-        static void FindFiles(string directory, string fileName, string searchString, bool ignoreCase = false, bool useRegex = false, string outputFormat = "path")
+        static void FindFiles(string directory, string fileName, string searchString, bool ignoreCase = false, bool useRegex = false, string outputFormat = "path", string[] excludeDirs = null)
         {
             try
             {
@@ -113,13 +126,20 @@ namespace StrFind
 
                 Console.WriteLine($"正在搜索目录: {directory}");
                 Console.WriteLine($"文件名: {fileName}");
-                Console.WriteLine($"搜索字符串: {searchString}");
+                Console.WriteLine($"搜索字符串: \"{searchString}\"");
                 Console.WriteLine($"忽略大小写: {(ignoreCase ? "是" : "否")}");
                 Console.WriteLine($"使用正则表达式: {(useRegex ? "是" : "否")}");
+                
+                // 显示忽略的目录
+                if (excludeDirs != null && excludeDirs.Length > 0)
+                {
+                    Console.WriteLine($"忽略目录: {string.Join(", ", excludeDirs)}");
+                }
+                
                 Console.WriteLine("----------------------------------------");
 
-                // 获取所有匹配的文件
-                var files = Directory.GetFiles(directory, fileName, SearchOption.AllDirectories);
+                // 获取所有匹配的文件（自定义搜索以排除指定目录）
+                var files = GetFilesExcludingDirectories(directory, fileName, excludeDirs);
                 
                 if (files.Length == 0)
                 {
@@ -136,6 +156,9 @@ namespace StrFind
                 StringComparison comparison = ignoreCase ? 
                     StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
                 
+                // 处理特殊字符，避免命令行解析问题
+                string processedSearchString = searchString;
+                
                 // 检查每个文件是否包含搜索字符串
                 foreach (var file in files)
                 {
@@ -151,18 +174,28 @@ namespace StrFind
                                 System.Text.RegularExpressions.RegexOptions.IgnoreCase : 
                                 System.Text.RegularExpressions.RegexOptions.None;
                             
-                            isMatch = System.Text.RegularExpressions.Regex.IsMatch(content, searchString, regexOptions);
+                            // 对正则表达式进行转义处理，避免特殊字符导致的解析错误
+                            try
+                            {
+                                isMatch = System.Text.RegularExpressions.Regex.IsMatch(content, processedSearchString, regexOptions);
+                            }
+                            catch (ArgumentException ex)
+                            {
+                                Console.WriteLine($"正则表达式解析错误: {ex.Message}");
+                                Console.WriteLine("请检查您的正则表达式语法或使用引号包围搜索字符串");
+                                return;
+                            }
                         }
                         else
                         {
                             // 使用普通字符串搜索
                             if (ignoreCase)
                             {
-                                isMatch = content.IndexOf(searchString, StringComparison.OrdinalIgnoreCase) >= 0;
+                                isMatch = content.IndexOf(processedSearchString, StringComparison.OrdinalIgnoreCase) >= 0;
                             }
                             else
                             {
-                                isMatch = content.Contains(searchString);
+                                isMatch = content.Contains(processedSearchString);
                             }
                         }
                         
@@ -220,6 +253,56 @@ namespace StrFind
             {
                 Console.WriteLine($"发生错误: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// 获取指定目录下的所有文件，排除指定的子目录
+        /// </summary>
+        /// <param name="rootDirectory">根目录</param>
+        /// <param name="searchPattern">搜索模式</param>
+        /// <param name="excludeDirectories">要排除的目录名称数组</param>
+        /// <returns>符合条件的文件路径列表</returns>
+        static string[] GetFilesExcludingDirectories(string rootDirectory, string searchPattern, string[] excludeDirectories)
+        {
+            var result = new List<string>();
+            
+            // 如果排除目录为空，初始化为空数组
+            if (excludeDirectories == null)
+            {
+                excludeDirectories = Array.Empty<string>();
+            }
+
+            try
+            {
+                // 获取根目录中的所有文件
+                foreach (var file in Directory.GetFiles(rootDirectory, searchPattern))
+                {
+                    result.Add(file);
+                }
+
+                // 递归处理子目录
+                foreach (var subDir in Directory.GetDirectories(rootDirectory))
+                {
+                    // 检查当前目录名是否在排除列表中
+                    string dirName = Path.GetFileName(subDir);
+                    
+                    // 如果目录名在排除列表中，则跳过
+                    if (excludeDirectories.Any(exclude => 
+                        string.Equals(dirName, exclude, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        continue;
+                    }
+
+                    // 递归处理非排除的子目录
+                    result.AddRange(GetFilesExcludingDirectories(subDir, searchPattern, excludeDirectories));
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"访问目录 '{rootDirectory}' 时出错: {ex.Message}");
+            }
+
+            return result.ToArray();
         }
     }
 }
